@@ -19,7 +19,7 @@ use futures_util::StreamExt;
 use reis::ei;
 use reis::event::{self as rev, DeviceCapability, EiEvent};
 use tokio::sync::oneshot;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 use xkbcommon::xkb;
 
 use super::Backend;
@@ -208,7 +208,12 @@ enum DeviceChoice {
 impl DeviceChoice {
     fn missing_error(self) -> &'static str {
         match self {
-            Self::Keyboard => "no keyboard device from EIS",
+            Self::Keyboard => {
+                "no keyboard device from EIS. The portal accepted Keyboard in select_devices \
+                 but no ei_keyboard interface arrived on the seat. \
+                 On KDE, enable `kwin_libeis.debug=true` in `~/.config/QtProject/qtlogging.ini` \
+                 and check `journalctl --user -b _COMM=kwin_wayland`."
+            }
             Self::Pointer => "no relative-pointer device from EIS",
             Self::PointerAbsolute => "no absolute-pointer device from EIS",
         }
@@ -344,6 +349,12 @@ async fn open_context() -> Result<ei::Context> {
         Err(err) => return Err(portal_err(err)),
     };
 
+    info!(
+        granted = ?selected.devices(),
+        used_cached_token = used_cached,
+        "libei portal start: device types granted"
+    );
+
     // Only persist on Some. The portal can return None on a successful
     // start (e.g., user opted out of "remember this choice"); in that
     // case leaving the previous cache untouched is correct — a stale
@@ -430,17 +441,39 @@ fn portal_err(e: ashpd::Error) -> WdoError {
 fn handle_event(st: &mut State, event: EiEvent) -> bool {
     match event {
         EiEvent::SeatAdded(ev) => {
-            let caps: BitFlags<DeviceCapability> = DeviceCapability::Keyboard
+            // KWin's EIS backend (as of Plasma 6.6.5) silently drops the
+            // keyboard device if Keyboard is bound in the same
+            // ei_seat.bind call as Pointer or PointerAbsolute. Binding
+            // Keyboard with only Button/Scroll, or alone, works fine. So
+            // we bind keyboard first to get the keyboard device created,
+            // then bind the full set; the second bind keeps the existing
+            // keyboard device and triggers pointer/absolute creation.
+            // Upstream: https://bugs.kde.org/show_bug.cgi?id=520464
+            let caps_all: BitFlags<DeviceCapability> = DeviceCapability::Keyboard
                 | DeviceCapability::Pointer
                 | DeviceCapability::PointerAbsolute
                 | DeviceCapability::Button
                 | DeviceCapability::Scroll;
-            ev.seat.bind_capabilities(caps);
-            trace!("bound seat capabilities");
+            ev.seat.bind_capabilities(DeviceCapability::Keyboard.into());
+            if let Err(err) = st.connection.flush() {
+                warn!(?err, "failed to flush libei seat bind (stage 1, keyboard)");
+            }
+            ev.seat.bind_capabilities(caps_all);
+            if let Err(err) = st.connection.flush() {
+                warn!(?err, "failed to flush libei seat bind (stage 2, full set)");
+            }
+            info!(
+                seat_name = ev.seat.name().unwrap_or("<unnamed>"),
+                "libei SeatAdded, two-stage bind (kbd first, then full set; KDE workaround)"
+            );
         }
         EiEvent::DeviceAdded(ev) => {
             let device = ev.device.clone();
+            let name = device.name().unwrap_or("<unnamed>").to_string();
+            let device_type = format!("{:?}", device.device_type());
+            let mut found = Vec::new();
             if device.has_capability(DeviceCapability::Keyboard) {
+                found.push("keyboard");
                 if let Some(keymap_info) = device.keymap() {
                     match load_keymap(keymap_info) {
                         Ok(km) => st.keymap = Some(SafeKeymap(km)),
@@ -450,16 +483,34 @@ fn handle_event(st: &mut State, event: EiEvent) -> bool {
                 st.keyboard = Some(device.clone());
             }
             if device.has_capability(DeviceCapability::Pointer) {
+                found.push("pointer");
                 st.pointer = Some(device.clone());
             }
             if device.has_capability(DeviceCapability::PointerAbsolute) {
+                found.push("pointer_absolute");
                 st.pointer_abs = Some(device.clone());
             }
+            if device.has_capability(DeviceCapability::Button) {
+                found.push("button");
+            }
+            if device.has_capability(DeviceCapability::Scroll) {
+                found.push("scroll");
+            }
+            if device.has_capability(DeviceCapability::Touch) {
+                found.push("touch");
+            }
+            info!(name, device_type, caps = ?found, "libei DeviceAdded");
         }
         EiEvent::DeviceResumed(_) => {
-            return st.keyboard.is_some() || st.pointer.is_some() || st.pointer_abs.is_some();
+            let has_kbd = st.keyboard.is_some();
+            let has_ptr = st.pointer.is_some();
+            let has_ptr_abs = st.pointer_abs.is_some();
+            let ready = has_kbd || has_ptr || has_ptr_abs;
+            info!(has_kbd, has_ptr, has_ptr_abs, ready, "libei DeviceResumed");
+            return ready;
         }
         EiEvent::DeviceRemoved(ev) => {
+            info!("libei DeviceRemoved");
             if st.keyboard.as_ref() == Some(&ev.device) {
                 st.keyboard = None;
             }
@@ -473,7 +524,9 @@ fn handle_event(st: &mut State, event: EiEvent) -> bool {
         EiEvent::Disconnected(d) => {
             warn!(reason = ?d.reason, "EIS disconnected: {:?}", d.explanation);
         }
-        _ => {}
+        other => {
+            debug!("libei event (other): {:?}", other);
+        }
     }
     false
 }
