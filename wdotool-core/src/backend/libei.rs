@@ -5,6 +5,7 @@
 //! tokio runtime to drive the stream. Emit methods run on the caller's thread
 //! — they're synchronous through the `Connection` proxy, which is `Send + Sync`.
 
+use std::collections::BTreeSet;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,7 +61,10 @@ fn libei_timeout_secs() -> u64 {
 pub struct LibeiBackend {
     state: Arc<Mutex<State>>,
     start: Instant,
+    lifetime: lifecycle::Lifetime,
 }
+
+mod lifecycle;
 
 // xkb_keymap is documented thread-safe for read operations; we gate access
 // behind the outer State mutex anyway.
@@ -73,23 +77,28 @@ struct State {
     keyboard: Option<rev::Device>,
     pointer: Option<rev::Device>,
     pointer_abs: Option<rev::Device>,
+    button: Option<rev::Device>,
     keymap: Option<SafeKeymap>,
     sequence: u32,
+    failure: Option<String>,
+    held_keys: BTreeSet<u32>,
+    held_buttons: BTreeSet<u32>,
 }
 
 impl LibeiBackend {
     pub async fn try_new() -> Result<Self> {
         // Portal session is async — this has to happen on the caller's tokio
         // runtime because ashpd uses zbus on the current runtime.
-        let context = open_context().await?;
+        let (context, session) = open_context().await?;
+        let (stop_tx, stop_rx) = oneshot::channel();
 
         // Now cross into a dedicated OS thread that runs its own current-thread
         // tokio runtime. That thread owns the (!Send) event stream. A oneshot
         // signals when the first usable device has Resumed.
-        let (connection_tx, connection_rx) = std::sync::mpsc::sync_channel::<InitResult>(1);
+        let (connection_tx, connection_rx) = oneshot::channel::<InitResult>();
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
 
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("wdotool-libei".into())
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -103,24 +112,31 @@ impl LibeiBackend {
                         return;
                     }
                 };
-                rt.block_on(dispatcher(context, connection_tx, ready_tx));
+                rt.block_on(async move {
+                    let mut session = session;
+                    dispatcher(context, connection_tx, ready_tx, stop_rx, &session.session).await;
+                    session.close().await;
+                });
             })
             .map_err(|e| WdoError::Backend {
                 backend: NAME,
                 source: Box::new(e),
             })?;
+        let lifetime = lifecycle::Lifetime::new(stop_tx, thread);
 
         // Block for the initial connection (fast — no user interaction here).
-        let connection = connection_rx
-            .recv()
-            .map_err(|_| WdoError::Backend {
-                backend: NAME,
-                source: "dispatcher thread exited before sending state".into(),
-            })?
-            .map_err(|msg: String| WdoError::Backend {
-                backend: NAME,
-                source: msg.into(),
-            })?;
+        let connection =
+            tokio::time::timeout(Duration::from_secs(libei_timeout_secs()), connection_rx)
+                .await
+                .map_err(|_| lifecycle::failure("timed out during EIS handshake"))?
+                .map_err(|_| WdoError::Backend {
+                    backend: NAME,
+                    source: "dispatcher thread exited before sending state".into(),
+                })?
+                .map_err(|msg: String| WdoError::Backend {
+                    backend: NAME,
+                    source: msg.into(),
+                })?;
 
         let state = connection.state.clone();
 
@@ -157,6 +173,7 @@ impl LibeiBackend {
         Ok(Self {
             state,
             start: Instant::now(),
+            lifetime,
         })
     }
 
@@ -166,9 +183,12 @@ impl LibeiBackend {
 
     fn emit_frame<F>(&self, pick: DeviceChoice, body: F) -> Result<()>
     where
-        F: FnOnce(&rev::Device, &State),
+        F: FnOnce(&rev::Device, &mut State),
     {
         let mut st = self.state.lock().unwrap();
+        if let Some(reason) = &st.failure {
+            return Err(lifecycle::failure(reason));
+        }
         let serial = st.connection.serial();
         st.sequence = st.sequence.wrapping_add(1);
         let seq = st.sequence;
@@ -177,6 +197,7 @@ impl LibeiBackend {
             DeviceChoice::Keyboard => st.keyboard.clone(),
             DeviceChoice::Pointer => st.pointer.clone(),
             DeviceChoice::PointerAbsolute => st.pointer_abs.clone(),
+            DeviceChoice::Button => st.button.clone(),
         };
 
         let Some(device) = device else {
@@ -187,13 +208,14 @@ impl LibeiBackend {
         };
 
         device.device().start_emulating(serial, seq);
-        body(&device, &st);
+        body(&device, &mut st);
         device.device().frame(serial, self.timestamp_us());
         device.device().stop_emulating(serial);
-        st.connection.flush().map_err(|e| WdoError::Backend {
-            backend: NAME,
-            source: format!("ei flush failed: {e}").into(),
-        })?;
+        if let Err(err) = st.connection.flush() {
+            let reason = format!("ei flush failed: {err}");
+            st.failure = Some(reason.clone());
+            return Err(lifecycle::failure(&reason));
+        }
         Ok(())
     }
 }
@@ -203,6 +225,7 @@ enum DeviceChoice {
     Keyboard,
     Pointer,
     PointerAbsolute,
+    Button,
 }
 
 impl DeviceChoice {
@@ -216,6 +239,7 @@ impl DeviceChoice {
             }
             Self::Pointer => "no relative-pointer device from EIS",
             Self::PointerAbsolute => "no absolute-pointer device from EIS",
+            Self::Button => "no button device from EIS",
         }
     }
 }
@@ -231,13 +255,16 @@ type InitResult = std::result::Result<InitOk, String>;
 /// keeps draining events so pings get answered.
 async fn dispatcher(
     context: ei::Context,
-    init_tx: std::sync::mpsc::SyncSender<InitResult>,
+    init_tx: oneshot::Sender<InitResult>,
     ready_tx: oneshot::Sender<()>,
+    mut stop: oneshot::Receiver<()>,
+    session: &Option<Arc<ashpd::desktop::Session<RemoteDesktop>>>,
 ) {
-    let (connection, mut stream) = match context
-        .handshake_tokio(crate::APP_ID, ei::handshake::ContextType::Sender)
-        .await
-    {
+    let handshake = tokio::select! {
+        _ = &mut stop => return,
+        result = context.handshake_tokio(crate::APP_ID, ei::handshake::ContextType::Sender) => result,
+    };
+    let (connection, mut stream) = match handshake {
         Ok(pair) => pair,
         Err(err) => {
             let _ = init_tx.send(Err(format!("ei handshake failed: {err}")));
@@ -251,8 +278,12 @@ async fn dispatcher(
         keyboard: None,
         pointer: None,
         pointer_abs: None,
+        button: None,
         keymap: None,
         sequence: 0,
+        failure: None,
+        held_keys: BTreeSet::new(),
+        held_buttons: BTreeSet::new(),
     }));
 
     if init_tx
@@ -263,31 +294,68 @@ async fn dispatcher(
     {
         return;
     }
-    drop(init_tx);
 
     let mut ready_tx = Some(ready_tx);
-    while let Some(result) = stream.next().await {
+    let closed = lifecycle::portal_closed(session);
+    tokio::pin!(closed);
+    let reason = loop {
+        let result = tokio::select! {
+            _ = &mut stop => break "libei connection shut down".to_string(),
+            _ = &mut closed => break "RemoteDesktop authorization revoked or portal session closed".to_string(),
+            result = stream.next() => result,
+        };
+        let Some(result) = result else {
+            break "libei event stream ended".to_string();
+        };
         let event = match result {
             Ok(ev) => ev,
             Err(err) => {
-                warn!(?err, "libei stream error, ending dispatch");
-                break;
+                break format!("libei stream error: {err}");
             }
         };
+        if let EiEvent::Disconnected(d) = &event {
+            break format!("EIS disconnected: {:?}: {:?}", d.reason, d.explanation);
+        }
         let mut st = state.lock().unwrap();
+        if let EiEvent::DevicePaused(ev) = &event {
+            if st.keyboard.as_ref() == Some(&ev.device)
+                || st.pointer.as_ref() == Some(&ev.device)
+                || st.pointer_abs.as_ref() == Some(&ev.device)
+                || st.button.as_ref() == Some(&ev.device)
+            {
+                break "EIS input device paused".to_string();
+            }
+        }
+        if let EiEvent::DeviceRemoved(ev) = &event {
+            if st.keyboard.as_ref() == Some(&ev.device)
+                || st.pointer.as_ref() == Some(&ev.device)
+                || st.pointer_abs.as_ref() == Some(&ev.device)
+                || st.button.as_ref() == Some(&ev.device)
+            {
+                break "EIS input device removed".to_string();
+            }
+        }
         if handle_event(&mut st, event) {
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(());
             }
         }
-    }
-    debug!("libei event stream ended");
+    };
+    let mut st = state.lock().unwrap();
+    st.failure = Some(reason.clone());
+    st.keyboard = None;
+    st.pointer = None;
+    st.pointer_abs = None;
+    st.button = None;
+    st.connection.connection().disconnect();
+    let _ = st.connection.flush();
+    debug!(reason, "libei dispatcher stopped");
 }
 
-async fn open_context() -> Result<ei::Context> {
+async fn open_context() -> Result<(ei::Context, lifecycle::PortalOwner)> {
     if let Ok(Some(context)) = ei::Context::connect_to_env() {
         debug!("connected to libei via LIBEI_SOCKET");
-        return Ok(context);
+        return Ok((context, lifecycle::PortalOwner::new(None)));
     }
 
     debug!("opening RemoteDesktop portal session");
@@ -296,7 +364,22 @@ async fn open_context() -> Result<ei::Context> {
         .create_session(CreateSessionOptions::default())
         .await
         .map_err(portal_err)?;
+    let mut owner = lifecycle::PortalOwner::new(Some(Arc::new(session)));
+    let session = owner.session.as_ref().unwrap();
+    match connect_portal(&remote, session).await {
+        Ok(context) => Ok((context, owner)),
+        Err(err) => {
+            owner.close().await;
+            Err(err)
+        }
+    }
+}
 
+/// Authorize the owned portal session using the existing restore-token policy.
+async fn connect_portal(
+    remote: &RemoteDesktop,
+    session: &ashpd::desktop::Session<RemoteDesktop>,
+) -> Result<ei::Context> {
     // Recovery flow for the portal restore_token. Without this cache,
     // every wdotool invocation pops a consent dialog. With it: the
     // first run prompts once, every subsequent run is silent until the
@@ -335,14 +418,14 @@ async fn open_context() -> Result<ei::Context> {
     // run_session_flow runs select_devices + start. Start's response
     // is what carries the freshly-issued restore_token, so both calls
     // need to live inside the retry boundary.
-    let selected = match run_session_flow(&remote, &session, cached_token.as_deref()).await {
+    let selected = match run_session_flow(remote, session, cached_token.as_deref()).await {
         Ok(devices) => devices,
         Err(first_err) if used_cached => {
             info!(
                 error = %first_err,
                 "cached portal token did not satisfy session start, retrying with consent dialog"
             );
-            run_session_flow(&remote, &session, None)
+            run_session_flow(remote, session, None)
                 .await
                 .map_err(portal_err)?
         }
@@ -368,7 +451,7 @@ async fn open_context() -> Result<ei::Context> {
     }
 
     let fd = remote
-        .connect_to_eis(&session, ConnectToEISOptions::default())
+        .connect_to_eis(session, ConnectToEISOptions::default())
         .await
         .map_err(portal_err)?;
     let stream = UnixStream::from(fd);
@@ -492,6 +575,7 @@ fn handle_event(st: &mut State, event: EiEvent) -> bool {
             }
             if device.has_capability(DeviceCapability::Button) {
                 found.push("button");
+                st.button = Some(device.clone());
             }
             if device.has_capability(DeviceCapability::Scroll) {
                 found.push("scroll");
@@ -609,6 +693,23 @@ fn xdotool_button_to_evdev(btn: MouseButton) -> Option<u32> {
 
 #[async_trait]
 impl Backend for LibeiBackend {
+    fn check_health(&self) -> Result<()> {
+        match &self.state.lock().unwrap().failure {
+            Some(reason) => Err(lifecycle::failure(reason)),
+            None => Ok(()),
+        }
+    }
+
+    async fn release_input(&self) -> Result<()> {
+        self.release_held()
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        let released = self.release_held();
+        let stopped = self.lifetime.shutdown().await;
+        released.and(stopped)
+    }
+
     fn name(&self) -> &'static str {
         NAME
     }
@@ -648,7 +749,7 @@ impl Backend for LibeiBackend {
             (kc, needs_shift, shift_kc)
         };
 
-        self.emit_frame(DeviceChoice::Keyboard, |device, _st| {
+        self.emit_frame(DeviceChoice::Keyboard, |device, st| {
             let Some(kb) = device.interface::<ei::Keyboard>() else {
                 return;
             };
@@ -656,30 +757,30 @@ impl Backend for LibeiBackend {
                 KeyDirection::Press => {
                     if needs_shift {
                         if let Some(kc) = shift_kc {
-                            kb.key(kc, ei::keyboard::KeyState::Press);
+                            st.send_key(&kb, kc, ei::keyboard::KeyState::Press);
                         }
                     }
-                    kb.key(keycode, ei::keyboard::KeyState::Press);
+                    st.send_key(&kb, keycode, ei::keyboard::KeyState::Press);
                 }
                 KeyDirection::Release => {
-                    kb.key(keycode, ei::keyboard::KeyState::Released);
+                    st.send_key(&kb, keycode, ei::keyboard::KeyState::Released);
                     if needs_shift {
                         if let Some(kc) = shift_kc {
-                            kb.key(kc, ei::keyboard::KeyState::Released);
+                            st.send_key(&kb, kc, ei::keyboard::KeyState::Released);
                         }
                     }
                 }
                 KeyDirection::PressRelease => {
                     if needs_shift {
                         if let Some(kc) = shift_kc {
-                            kb.key(kc, ei::keyboard::KeyState::Press);
+                            st.send_key(&kb, kc, ei::keyboard::KeyState::Press);
                         }
                     }
-                    kb.key(keycode, ei::keyboard::KeyState::Press);
-                    kb.key(keycode, ei::keyboard::KeyState::Released);
+                    st.send_key(&kb, keycode, ei::keyboard::KeyState::Press);
+                    st.send_key(&kb, keycode, ei::keyboard::KeyState::Released);
                     if needs_shift {
                         if let Some(kc) = shift_kc {
-                            kb.key(kc, ei::keyboard::KeyState::Released);
+                            st.send_key(&kb, kc, ei::keyboard::KeyState::Released);
                         }
                     }
                 }
@@ -735,25 +836,28 @@ impl Backend for LibeiBackend {
 
         let chars_count = text.chars().count();
         for (idx, (keycode, needs_shift)) in resolved.into_iter().enumerate() {
-            self.emit_frame(DeviceChoice::Keyboard, |device, _st| {
+            self.emit_frame(DeviceChoice::Keyboard, |device, st| {
                 let Some(kb) = device.interface::<ei::Keyboard>() else {
                     return;
                 };
                 if needs_shift {
                     if let Some(kc) = shift_kc {
-                        kb.key(kc, ei::keyboard::KeyState::Press);
+                        st.send_key(&kb, kc, ei::keyboard::KeyState::Press);
                     }
                 }
-                kb.key(keycode, ei::keyboard::KeyState::Press);
-                kb.key(keycode, ei::keyboard::KeyState::Released);
+                st.send_key(&kb, keycode, ei::keyboard::KeyState::Press);
+                st.send_key(&kb, keycode, ei::keyboard::KeyState::Released);
                 if needs_shift {
                     if let Some(kc) = shift_kc {
-                        kb.key(kc, ei::keyboard::KeyState::Released);
+                        st.send_key(&kb, kc, ei::keyboard::KeyState::Released);
                     }
                 }
             })?;
             if !delay.is_zero() && idx + 1 < chars_count {
                 tokio::time::sleep(delay).await;
+            } else {
+                // Keep zero-delay typing cancellable between complete frames.
+                tokio::task::yield_now().await;
             }
         }
         Ok(())
@@ -778,16 +882,18 @@ impl Backend for LibeiBackend {
     async fn mouse_button(&self, btn: MouseButton, dir: KeyDirection) -> Result<()> {
         let code = xdotool_button_to_evdev(btn)
             .ok_or_else(|| WdoError::InvalidArg(format!("unsupported mouse button: {btn:?}")))?;
-        self.emit_frame(DeviceChoice::Pointer, |device, _| {
+        self.emit_frame(DeviceChoice::Button, |device, st| {
             let Some(b) = device.interface::<ei::Button>() else {
                 return;
             };
             match dir {
-                KeyDirection::Press => b.button(code, ei::button::ButtonState::Press),
-                KeyDirection::Release => b.button(code, ei::button::ButtonState::Released),
+                KeyDirection::Press => st.send_button(&b, code, ei::button::ButtonState::Press),
+                KeyDirection::Release => {
+                    st.send_button(&b, code, ei::button::ButtonState::Released)
+                }
                 KeyDirection::PressRelease => {
-                    b.button(code, ei::button::ButtonState::Press);
-                    b.button(code, ei::button::ButtonState::Released);
+                    st.send_button(&b, code, ei::button::ButtonState::Press);
+                    st.send_button(&b, code, ei::button::ButtonState::Released);
                 }
             }
         })

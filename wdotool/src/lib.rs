@@ -19,6 +19,7 @@ pub mod diag;
 pub mod record;
 #[cfg(feature = "recorder")]
 pub mod replay;
+pub mod server;
 
 use std::io::Write;
 use std::time::Duration;
@@ -68,6 +69,7 @@ impl ExitCode {
 /// `process::exit` on non-zero, tests assert directly.
 pub async fn dispatch(ctx: &mut DispatchCtx<'_>, cmd: Command) -> Result<ExitCode> {
     match cmd {
+        Command::Server { .. } => unreachable!("Server short-circuits before dispatch"),
         Command::Capabilities { action } => {
             if let Some(name) = action {
                 let descriptors = wdotool_core::capabilities::action_descriptors();
@@ -443,7 +445,7 @@ async fn clear_modifiers(backend: &dyn Backend) {
 /// Resolve the text to type: from --file (path or `-` for stdin) or the
 /// positional argument. clap enforces mutual exclusion; this function just
 /// dispatches and errors if neither source is present.
-fn resolve_type_input(file: Option<String>, text: Option<String>) -> Result<String> {
+pub(crate) fn resolve_type_input(file: Option<String>, text: Option<String>) -> Result<String> {
     use std::io::Read;
     match (file, text) {
         (Some(path), _) => {

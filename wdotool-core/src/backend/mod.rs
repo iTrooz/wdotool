@@ -28,6 +28,21 @@ pub trait Backend: Send + Sync {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
 
+    /// Report terminal connection loss without opening or rebuilding a session.
+    fn check_health(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Release backend-internal input, including implicitly pressed modifiers.
+    async fn release_input(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// End a persistent connection after its caller has stopped submitting work.
+    async fn shutdown(&self) -> Result<()> {
+        self.release_input().await
+    }
+
     async fn key(&self, keysym: &str, dir: KeyDirection) -> Result<()>;
     async fn type_text(&self, text: &str, delay: Duration) -> Result<()>;
 

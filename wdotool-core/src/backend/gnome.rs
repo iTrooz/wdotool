@@ -131,6 +131,18 @@ fn dbus_err(e: zbus::Error) -> WdoError {
 
 #[async_trait]
 impl Backend for GnomeExtBackend {
+    fn check_health(&self) -> Result<()> {
+        self.libei.check_health()
+    }
+
+    async fn release_input(&self) -> Result<()> {
+        self.libei.release_input().await
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        self.libei.shutdown().await
+    }
+
     fn name(&self) -> &'static str {
         NAME
     }

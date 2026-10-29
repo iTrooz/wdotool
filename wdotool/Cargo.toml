@@ -33,14 +33,17 @@ recorder = ["wdotool-core/recorder"]
 [dependencies]
 wdotool-core = { path = "../wdotool-core", version = "0.5.3" }
 anyhow = "1"
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Already in the workspace dependency graph; used for uid checks and flock.
+rustix = { version = "1", features = ["fs", "process"] }
 # `signal` for Ctrl-C handling on `wdotool record`; `time` for the
 # `--max-duration` ceiling. Both are tiny — no reason to gate them
 # behind the recorder feature.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "time", "net", "io-util", "sync"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Integration tests need MockBackend, which lives behind the `testing`

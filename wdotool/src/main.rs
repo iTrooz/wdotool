@@ -1,6 +1,9 @@
 use clap::Parser;
 
-use wdotool::{cli::Command, diag, Cli, DispatchCtx, ExitCode};
+use wdotool::{
+    cli::{Command, ServerCommand},
+    diag, server, Cli, DispatchCtx, ExitCode,
+};
 use wdotool_core::detector::{self, BackendKind, Environment};
 use wdotool_core::WdoError;
 
@@ -23,6 +26,49 @@ async fn main() -> anyhow::Result<()> {
         };
         return diag::run(format, copy);
     }
+
+    // Route clients before any detection/build, including status and stop.
+    if let Command::Server { command } = cli.command {
+        anyhow::ensure!(
+            !cli.remote,
+            "--remote cannot be combined with server management"
+        );
+        let path = server::socket::path(cli.socket)?;
+        match command {
+            ServerCommand::Launch => {
+                server::launch(&path, parse_backend(cli.backend.as_deref())?).await?
+            }
+            command => {
+                anyhow::ensure!(
+                    cli.backend.is_none(),
+                    "--backend only applies to server launch"
+                );
+                let request = match command {
+                    ServerCommand::Status => server::protocol::Request::Status,
+                    ServerCommand::Stop => server::protocol::Request::Stop,
+                    ServerCommand::Launch => unreachable!(),
+                };
+                let exit = server::print_response(server::request(&path, request).await?)?;
+                if !exit.is_success() {
+                    std::process::exit(exit.0);
+                }
+            }
+        }
+        return Ok(());
+    }
+    if cli.remote {
+        let request = server::protocol::prepare(cli.command)?;
+        let path = server::socket::path(cli.socket)?;
+        let exit = server::print_response(server::request(&path, request).await?)?;
+        if !exit.is_success() {
+            std::process::exit(exit.0);
+        }
+        return Ok(());
+    }
+    anyhow::ensure!(
+        cli.socket.is_none(),
+        "--socket requires --remote or server management"
+    );
 
     // Record short-circuits before detector::build for the same
     // reason Diag does: the recorder owns its own portal session
@@ -60,14 +106,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let forced = match cli.backend.as_deref() {
-        Some(s) => Some(BackendKind::parse(s).ok_or_else(|| {
-            WdoError::InvalidArg(format!(
-                "unknown backend '{s}' (expected libei, wlr-protocols, kde, gnome, uinput)"
-            ))
-        })?),
-        None => None,
-    };
+    let forced = parse_backend(cli.backend.as_deref())?;
 
     let backend = detector::build(&env, forced).await?;
 
@@ -86,4 +125,16 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(exit.0);
     }
     Ok(())
+}
+
+/// Share backend spelling validation between direct mode and server launch.
+fn parse_backend(value: Option<&str>) -> anyhow::Result<Option<BackendKind>> {
+    Ok(match value {
+        Some(s) => Some(BackendKind::parse(s).ok_or_else(|| {
+            WdoError::InvalidArg(format!(
+                "unknown backend '{s}' (expected libei, wlr-protocols, kde, gnome, uinput)"
+            ))
+        })?),
+        None => None,
+    })
 }

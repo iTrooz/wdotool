@@ -686,6 +686,18 @@ fn close_window_script(req_id: i32, target_id: &str, bridge_addr: &str) -> Strin
 
 #[async_trait]
 impl Backend for KdeBackend {
+    fn check_health(&self) -> Result<()> {
+        self.libei.check_health()
+    }
+
+    async fn release_input(&self) -> Result<()> {
+        self.libei.release_input().await
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        self.libei.shutdown().await
+    }
+
     fn name(&self) -> &'static str {
         NAME
     }

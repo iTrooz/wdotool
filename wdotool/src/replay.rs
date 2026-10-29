@@ -35,7 +35,17 @@ pub async fn run(backend: &dyn Backend, file: &str, speed: f64) -> Result<()> {
         )));
     }
     let trace = read_trace(file)?;
-    let events: Vec<RecEvent> = serde_json::from_str(&trace).map_err(|e| {
+    run_trace(backend, &trace, speed).await
+}
+
+/// Dispatch an already loaded trace, including traces forwarded by an IPC client.
+pub async fn run_trace(backend: &dyn Backend, trace: &str, speed: f64) -> Result<()> {
+    if !speed.is_finite() || speed <= 0.0 {
+        return Err(WdoError::InvalidArg(
+            "--speed must be finite and positive".into(),
+        ));
+    }
+    let events: Vec<RecEvent> = serde_json::from_str(trace).map_err(|e| {
         WdoError::InvalidArg(format!("failed to parse trace as RecEvent JSON: {e}"))
     })?;
 
@@ -45,7 +55,7 @@ pub async fn run(backend: &dyn Backend, file: &str, speed: f64) -> Result<()> {
     Ok(())
 }
 
-fn read_trace(file: &str) -> Result<String> {
+pub(crate) fn read_trace(file: &str) -> Result<String> {
     if file == "-" {
         use std::io::Read;
         let mut buf = String::new();

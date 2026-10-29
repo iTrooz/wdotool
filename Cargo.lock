@@ -1337,8 +1337,10 @@ name = "wdotool"
 version = "0.5.3"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "regex",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

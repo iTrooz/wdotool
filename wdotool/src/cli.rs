@@ -1,4 +1,16 @@
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+
+/// Explicit lifecycle controls; none of these implicitly start a server.
+#[derive(Subcommand, Debug, Serialize, Deserialize)]
+pub enum ServerCommand {
+    /// Authorize one backend and serve commands until stopped (foreground).
+    Launch,
+    /// Report whether the server is running and name its backend.
+    Status,
+    /// Release held input and close the server's connection.
+    Stop,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -18,12 +30,25 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
+    /// Send this command to an explicitly launched server (never falls back).
+    #[arg(long, global = true, conflicts_with = "backend")]
+    pub remote: bool,
+
+    /// Server socket; defaults to $XDG_RUNTIME_DIR/wdotool/control.sock.
+    #[arg(long, global = true)]
+    pub socket: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Serialize, Deserialize)]
 pub enum Command {
+    /// Manage a persistent input session. Launch runs in the foreground.
+    Server {
+        #[command(subcommand)]
+        command: ServerCommand,
+    },
     /// Press and release a key chain (e.g. "ctrl+c").
     Key {
         /// Release stuck modifiers (Ctrl/Shift/Alt/Super/AltGr) before the op.
